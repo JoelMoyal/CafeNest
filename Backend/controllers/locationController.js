@@ -232,55 +232,64 @@ const locationController = {
       if (amenitiesResult.rows.length > 0) {
         location.amenities = amenitiesResult.rows[0];
       }
-      
+
       // Get dietary options
       const dietaryQuery = `
-        INSERT INTO location_dietary_options 
-        (location_id, has_vegan, has_vegetarian, has_gluten_free, has_dairy_free, has_other_options)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        SELECT * FROM location_dietary_options WHERE location_id = $1
       `;
-      
-      const dietaryValues = [
-        locationId,
-        has_vegan || false,
-        has_vegetarian || false,
-        has_gluten_free || false,
-        has_dairy_free || false,
-        other_dietary || null
-      ];
-      
-      await client.query(dietaryQuery, dietaryValues);
-      
-      // 5. Upload and save photos
-      const photos = await handlePhotoUploads(req.files, locationId, userId);
-      
-      // 6. Add to location history
-      const historyQuery = `
-        INSERT INTO location_history 
-        (location_id, modified_by, modification_type, modified_at, reason)
-        VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4)
+      const dietaryResult = await pool.query(dietaryQuery, [id]);
+
+      if (dietaryResult.rows.length > 0) {
+        location.dietary = dietaryResult.rows[0];
+      }
+
+      // Get hours
+      const hoursQuery = `
+        SELECT day_of_week, open_time, close_time, is_closed
+        FROM location_hours
+        WHERE location_id = $1
+        ORDER BY day_of_week
       `;
-      
-      await client.query(historyQuery, [
-        locationId,
-        userId,
-        'create',
-        'Initial submission'
-      ]);
-      
-      await client.query('COMMIT');
-      
-      res.status(201).json({
+      const hoursResult = await pool.query(hoursQuery, [id]);
+      location.hours = hoursResult.rows;
+
+      // Get photos
+      const photosQuery = `
+        SELECT photo_id, photo_url, caption, is_primary
+        FROM location_photos
+        WHERE location_id = $1 AND status = 'approved'
+      `;
+      const photosResult = await pool.query(photosQuery, [id]);
+      location.photos = photosResult.rows;
+
+      // Get top reviews
+      const reviewsQuery = `
+        SELECT r.review_id, r.overall_rating, r.wifi_rating, r.power_rating,
+               r.comfort_rating, r.noise_rating, r.review_text, r.created_at,
+               r.likes_count, r.dislikes_count,
+               u.user_id, u.first_name, u.last_name, u.profile_photo_url
+        FROM location_reviews r
+        JOIN users u ON r.user_id = u.user_id
+        WHERE r.location_id = $1 AND r.status = 'active'
+        ORDER BY r.likes_count DESC, r.created_at DESC
+        LIMIT 3
+      `;
+      const reviewsResult = await pool.query(reviewsQuery, [id]);
+      location.top_reviews = reviewsResult.rows;
+
+      // Update view count
+      await pool.query(`
+        UPDATE locations
+        SET view_count = view_count + 1
+        WHERE location_id = $1
+      `, [id]);
+
+      res.json({
         success: true,
-        message: 'Location submitted successfully and pending approval',
-        locationId,
-        photos
+        location
       });
     } catch (error) {
-      await client.query('ROLLBACK');
       next(error);
-    } finally {
-      client.release();
     }
   },
 
@@ -1003,157 +1012,4 @@ const locationController = {
   }
 };
 
-module.exports = locationController; `
-        SELECT * FROM location_dietary_options WHERE location_id = $1
-      `;
-      const dietaryResult = await pool.query(dietaryQuery, [id]);
-      
-      if (dietaryResult.rows.length > 0) {
-        location.dietary = dietaryResult.rows[0];
-      }
-      
-      // Get hours
-      const hoursQuery = `
-        SELECT day_of_week, open_time, close_time, is_closed 
-        FROM location_hours 
-        WHERE location_id = $1
-        ORDER BY day_of_week
-      `;
-      const hoursResult = await pool.query(hoursQuery, [id]);
-      location.hours = hoursResult.rows;
-      
-      // Get photos
-      const photosQuery = `
-        SELECT photo_id, photo_url, caption, is_primary
-        FROM location_photos
-        WHERE location_id = $1 AND status = 'approved'
-      `;
-      const photosResult = await pool.query(photosQuery, [id]);
-      location.photos = photosResult.rows;
-      
-      // Get top reviews
-      const reviewsQuery = `
-        SELECT r.review_id, r.overall_rating, r.wifi_rating, r.power_rating, 
-               r.comfort_rating, r.noise_rating, r.review_text, r.created_at,
-               r.likes_count, r.dislikes_count,
-               u.user_id, u.first_name, u.last_name, u.profile_photo_url
-        FROM location_reviews r
-        JOIN users u ON r.user_id = u.user_id
-        WHERE r.location_id = $1 AND r.status = 'active'
-        ORDER BY r.likes_count DESC, r.created_at DESC
-        LIMIT 3
-      `;
-      const reviewsResult = await pool.query(reviewsQuery, [id]);
-      location.top_reviews = reviewsResult.rows;
-      
-      // Update view count
-      await pool.query(`
-        UPDATE locations 
-        SET view_count = view_count + 1 
-        WHERE location_id = $1
-      `, [id]);
-      
-      res.json({
-        success: true,
-        location
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-  
-  // Add a new location
-  addLocation: async (req, res, next) => {
-    const client = await pool.connect();
-    
-    try {
-      await client.query('BEGIN');
-      
-      const {
-        name, address, city, state, country, zip_code,
-        latitude, longitude, website, phone, email,
-        
-        // Hours
-        hours,
-        
-        // Amenities
-        has_wifi, wifi_speed, wifi_password, wifi_restrictions,
-        power_outlets, noise_level, seating_comfort,
-        time_restrictions, purchase_requirements,
-        price_range, restrooms_available, parking_options, special_features,
-        
-        // Dietary options
-        has_vegan, has_vegetarian, has_gluten_free, has_dairy_free, other_dietary
-      } = req.body;
-      
-      const userId = req.user.id;
-      
-      // 1. Insert location
-      const locationQuery = `
-        INSERT INTO locations 
-        (name, address, city, state, country, zip_code, latitude, longitude, 
-         website, phone, email, submitted_by, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        RETURNING location_id
-      `;
-      
-      const locationValues = [
-        name, address, city, state, country, zip_code,
-        latitude, longitude, website, phone, email,
-        userId, 'pending' // Default status is pending until approved
-      ];
-      
-      const locationResult = await client.query(locationQuery, locationValues);
-      const locationId = locationResult.rows[0].location_id;
-      
-      // 2. Insert operating hours
-      if (hours && Array.isArray(hours)) {
-        const hoursQuery = `
-          INSERT INTO location_hours 
-          (location_id, day_of_week, open_time, close_time, is_closed)
-          VALUES ($1, $2, $3, $4, $5)
-        `;
-        
-        for (const hour of hours) {
-          await client.query(hoursQuery, [
-            locationId,
-            hour.day_of_week,
-            hour.open_time,
-            hour.close_time,
-            hour.is_closed || false
-          ]);
-        }
-      }
-      
-      // 3. Insert amenities
-      const amenitiesQuery = `
-        INSERT INTO location_amenities 
-        (location_id, has_wifi, wifi_speed, wifi_password, wifi_restrictions,
-         power_outlets, noise_level, seating_comfort, time_restrictions,
-         purchase_requirements, price_range, restrooms_available,
-         parking_options, special_features, updated_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-      `;
-      
-      const amenitiesValues = [
-        locationId,
-        has_wifi || false,
-        wifi_speed || null,
-        wifi_password || null,
-        wifi_restrictions || null,
-        power_outlets || 'None',
-        noise_level || 'Moderate',
-        seating_comfort || 'Fair',
-        time_restrictions || 'None',
-        purchase_requirements || 'None',
-        price_range || '$$',
-        restrooms_available !== undefined ? restrooms_available : true,
-        parking_options || 'None',
-        special_features || null,
-        userId
-      ];
-      
-      await client.query(amenitiesQuery, amenitiesValues);
-      
-      // 4. Insert dietary options
-      const dietaryQuery =
+module.exports = locationController;
